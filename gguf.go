@@ -490,3 +490,263 @@ func ConvertSafetensorsToGGUF(modelDir, outputPath string, quantType ...string) 
 
 	return w.Write(outputPath)
 }
+
+// GGUFReader reads tensors from a GGUF file.
+type GGUFReader struct {
+	f        *os.File
+	metadata map[string]interface{}
+	tensors  map[string]ggufTensorInfo
+	dataOff  int64
+}
+
+type ggufTensorInfo struct {
+	name   string
+	shape  []int
+	dtype  uint32
+	offset uint64
+	nElems int
+}
+
+// OpenGGUF opens a GGUF file for reading.
+func OpenGGUF(path string) (*GGUFReader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var magic, version uint32
+	binary.Read(f, binary.LittleEndian, &magic)
+	binary.Read(f, binary.LittleEndian, &version)
+	if magic != ggufMagic {
+		f.Close()
+		return nil, fmt.Errorf("not a GGUF file (magic %x)", magic)
+	}
+	if version < 2 || version > 3 {
+		f.Close()
+		return nil, fmt.Errorf("unsupported GGUF version %d", version)
+	}
+
+	var tensorCount, metadataCount uint64
+	binary.Read(f, binary.LittleEndian, &tensorCount)
+	binary.Read(f, binary.LittleEndian, &metadataCount)
+
+	r := &GGUFReader{
+		f:        f,
+		metadata: make(map[string]interface{}),
+		tensors:  make(map[string]ggufTensorInfo),
+	}
+
+	for i := uint64(0); i < metadataCount; i++ {
+		key := readGGUFString(f)
+		var valueType uint32
+		binary.Read(f, binary.LittleEndian, &valueType)
+		value := readGGUFValue(f, valueType)
+		r.metadata[key] = value
+	}
+
+	for i := uint64(0); i < tensorCount; i++ {
+		name := readGGUFString(f)
+		var nDims uint32
+		binary.Read(f, binary.LittleEndian, &nDims)
+		shape := make([]int, nDims)
+		nElems := 1
+		for d := uint32(0); d < nDims; d++ {
+			var dim uint64
+			binary.Read(f, binary.LittleEndian, &dim)
+			shape[d] = int(dim)
+			nElems *= int(dim)
+		}
+		var dtype uint32
+		var offset uint64
+		binary.Read(f, binary.LittleEndian, &dtype)
+		binary.Read(f, binary.LittleEndian, &offset)
+		r.tensors[name] = ggufTensorInfo{name: name, shape: shape, dtype: dtype, offset: offset, nElems: nElems}
+	}
+
+	// Data starts at next alignment boundary
+	pos, _ := f.Seek(0, 1)
+	if rem := pos % ggufAlignment; rem != 0 {
+		pos += int64(ggufAlignment) - rem
+	}
+	r.dataOff = pos
+
+	return r, nil
+}
+
+func (r *GGUFReader) Close() error { return r.f.Close() }
+
+// Metadata returns all metadata key-value pairs.
+func (r *GGUFReader) Metadata() map[string]interface{} { return r.metadata }
+
+// MetadataString returns a string metadata value.
+func (r *GGUFReader) MetadataString(key string) string {
+	if v, ok := r.metadata[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// MetadataUint32 returns a uint32 metadata value.
+func (r *GGUFReader) MetadataUint32(key string) uint32 {
+	if v, ok := r.metadata[key].(uint32); ok {
+		return v
+	}
+	return 0
+}
+
+// MetadataFloat32 returns a float32 metadata value.
+func (r *GGUFReader) MetadataFloat32(key string) float32 {
+	if v, ok := r.metadata[key].(float32); ok {
+		return v
+	}
+	return 0
+}
+
+// TensorNames returns all tensor names.
+func (r *GGUFReader) TensorNames() []string {
+	names := make([]string, 0, len(r.tensors))
+	for n := range r.tensors {
+		names = append(names, n)
+	}
+	return names
+}
+
+// HasTensor returns true if the tensor exists.
+func (r *GGUFReader) HasTensor(name string) bool {
+	_, ok := r.tensors[name]
+	return ok
+}
+
+// TensorShape returns the shape of a tensor.
+func (r *GGUFReader) TensorShape(name string) []int {
+	if t, ok := r.tensors[name]; ok {
+		return t.shape
+	}
+	return nil
+}
+
+// ReadTensorFloat32 reads a tensor and dequantizes to float32.
+func (r *GGUFReader) ReadTensorFloat32(name string) ([]float32, []int, error) {
+	t, ok := r.tensors[name]
+	if !ok {
+		return nil, nil, fmt.Errorf("tensor %q not found", name)
+	}
+
+	r.f.Seek(r.dataOff+int64(t.offset), 0)
+
+	switch t.dtype {
+	case GGUFTypeF32:
+		data := make([]float32, t.nElems)
+		binary.Read(r.f, binary.LittleEndian, data)
+		return data, t.shape, nil
+
+	case GGUFTypeF16:
+		raw := make([]uint16, t.nElems)
+		binary.Read(r.f, binary.LittleEndian, raw)
+		data := make([]float32, t.nElems)
+		for i, v := range raw {
+			data[i] = fp16ToFloat32(v)
+		}
+		return data, t.shape, nil
+
+	case GGUFTypeQ8: // Q8_0
+		return r.dequantQ8(t)
+
+	case 2: // Q4_0
+		return r.dequantQ4(t)
+
+	default:
+		return nil, nil, fmt.Errorf("tensor %q: unsupported dtype %d", name, t.dtype)
+	}
+}
+
+func (r *GGUFReader) dequantQ8(t ggufTensorInfo) ([]float32, []int, error) {
+	const blockSize = 32
+	nBlocks := (t.nElems + blockSize - 1) / blockSize
+	raw := make([]byte, nBlocks*34)
+	r.f.Read(raw)
+
+	data := make([]float32, t.nElems)
+	for b := 0; b < nBlocks; b++ {
+		off := b * 34
+		scaleFP16 := binary.LittleEndian.Uint16(raw[off:])
+		scale := fp16ToFloat32(scaleFP16)
+		count := blockSize
+		if b*blockSize+count > t.nElems {
+			count = t.nElems - b*blockSize
+		}
+		for i := 0; i < count; i++ {
+			data[b*blockSize+i] = float32(int8(raw[off+2+i])) * scale
+		}
+	}
+	return data, t.shape, nil
+}
+
+func (r *GGUFReader) dequantQ4(t ggufTensorInfo) ([]float32, []int, error) {
+	const blockSize = 32
+	nBlocks := (t.nElems + blockSize - 1) / blockSize
+	raw := make([]byte, nBlocks*18)
+	r.f.Read(raw)
+
+	data := make([]float32, t.nElems)
+	for b := 0; b < nBlocks; b++ {
+		off := b * 18
+		scaleFP16 := binary.LittleEndian.Uint16(raw[off:])
+		scale := fp16ToFloat32(scaleFP16)
+		count := blockSize
+		if b*blockSize+count > t.nElems {
+			count = t.nElems - b*blockSize
+		}
+		for i := 0; i < count/2; i++ {
+			packed := raw[off+2+i]
+			lo := int(packed&0x0F) - 8
+			hi := int(packed>>4) - 8
+			if i*2 < count {
+				data[b*blockSize+i*2] = float32(lo) * scale
+			}
+			if i*2+1 < count {
+				data[b*blockSize+i*2+1] = float32(hi) * scale
+			}
+		}
+	}
+	return data, t.shape, nil
+}
+
+func readGGUFString(f *os.File) string {
+	var n uint64
+	binary.Read(f, binary.LittleEndian, &n)
+	buf := make([]byte, n)
+	f.Read(buf)
+	return string(buf)
+}
+
+func readGGUFValue(f *os.File, valueType uint32) interface{} {
+	switch valueType {
+	case ggufTypeUint32:
+		var v uint32
+		binary.Read(f, binary.LittleEndian, &v)
+		return v
+	case ggufTypeFloat32:
+		var v float32
+		binary.Read(f, binary.LittleEndian, &v)
+		return v
+	case ggufTypeString:
+		return readGGUFString(f)
+	case ggufTypeArray:
+		var elemType uint32
+		var count uint64
+		binary.Read(f, binary.LittleEndian, &elemType)
+		binary.Read(f, binary.LittleEndian, &count)
+		for i := uint64(0); i < count; i++ {
+			readGGUFValue(f, elemType)
+		}
+		return nil // arrays stored in metadata but not returned for simplicity
+	default:
+		// Skip unknown types: read 4 bytes
+		var v uint32
+		binary.Read(f, binary.LittleEndian, &v)
+		return v
+	}
+}
+
+// fp16ToFloat32 is defined in safetensors.go
