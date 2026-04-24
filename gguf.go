@@ -625,6 +625,40 @@ func (r *GGUFReader) TensorShape(name string) []int {
 	return nil
 }
 
+// ReadTensorRaw reads raw bytes for a tensor without dequantization.
+// Returns the raw bytes, dtype code, element count, and shape.
+func (r *GGUFReader) ReadTensorRaw(name string) ([]byte, uint32, int, []int, error) {
+	t, ok := r.tensors[name]
+	if !ok {
+		return nil, 0, 0, nil, fmt.Errorf("tensor %q not found", name)
+	}
+	var nBytes int
+	switch t.dtype {
+	case GGUFTypeF32:
+		nBytes = t.nElems * 4
+	case GGUFTypeF16:
+		nBytes = t.nElems * 2
+	case GGUFTypeQ8: // Q8_0: 34 bytes per 32 elements
+		nBytes = ((t.nElems + 31) / 32) * 34
+	case 2: // Q4_0: 18 bytes per 32 elements
+		nBytes = ((t.nElems + 31) / 32) * 18
+	default:
+		return nil, 0, 0, nil, fmt.Errorf("tensor %q: unsupported dtype %d", name, t.dtype)
+	}
+	r.f.Seek(r.dataOff+int64(t.offset), 0)
+	data := make([]byte, nBytes)
+	r.f.Read(data)
+	return data, t.dtype, t.nElems, t.shape, nil
+}
+
+// TensorDtype returns the GGUF dtype code for a tensor.
+func (r *GGUFReader) TensorDtype(name string) uint32 {
+	if t, ok := r.tensors[name]; ok {
+		return t.dtype
+	}
+	return 0
+}
+
 // ReadTensorFloat32 reads a tensor and dequantizes to float32.
 func (r *GGUFReader) ReadTensorFloat32(name string) ([]float32, []int, error) {
 	t, ok := r.tensors[name]
