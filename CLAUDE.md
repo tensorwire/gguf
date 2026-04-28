@@ -37,5 +37,5 @@ gguf.WriteNpy("out.npy", data, 2, 3)
 
 ## Related Packages
 
-- `github.com/open-ai-org/mongoose` — GPU compute engine
-- `github.com/open-ai-org/tokenizer` — BPE tokenizer
+- `github.com/tensorwire/mongoose` — GPU compute engine
+- `github.com/tensorwire/tokenizer` — BPE tokenizer

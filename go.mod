@@ -1,3 +1,3 @@
-module github.com/open-ai-org/gguf
+module github.com/tensorwire/gguf
 
 go 1.25.0

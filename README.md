@@ -1,13 +1,11 @@
 # gguf
 
-> **This project has moved to [github.com/tensorwire/gguf](https://github.com/tensorwire/gguf).** Updates will be published under [github.com/tensorwire](https://github.com/tensorwire). Code remaining in open-ai-org is unmaintained.
-
 Go-native model serialization. Read and write GGUF, SafeTensors, and NumPy formats. Zero dependencies beyond stdlib.
 
 ## Install
 
 ```bash
-go get github.com/open-ai-org/gguf
+go get github.com/tensorwire/gguf
 ```
 
 ## Formats
